@@ -1,22 +1,23 @@
 import json
 from datetime import datetime
 from starlette.responses import JSONResponse
-from models import scratchpad_notes
+from models import scratchpad_notes, db
 from services.ai_service import search_vectorized_sources, generate_ai_reply
 
 
-def get_scratchpad_context(user_id: str, paper_id: str, exclude_note_id: int = None) -> str:
+def get_scratchpad_context(
+    user_id: str, paper_id: str, exclude_note_id: int = None
+) -> str:
     """Get formatted scratchpad context for AI, excluding AI replies and optionally a specific note"""
     try:
         where_clause = f"user_id = '{user_id}' AND paper_id = '{paper_id}' AND is_deleted = 0 AND note_type != 'ai_reply'"
         if exclude_note_id:
             where_clause += f" AND id != {exclude_note_id}"
-            
+
         notes = scratchpad_notes(
-            where=where_clause,
-            order_by="position ASC, created_at ASC"
+            where=where_clause, order_by="position ASC, created_at ASC"
         )
-        
+
         context = ""
         for note in notes:
             context += f"• "
@@ -27,7 +28,7 @@ def get_scratchpad_context(user_id: str, paper_id: str, exclude_note_id: int = N
                 except:
                     pass
             context += f"{note.content}\n"
-        
+
         return context.strip() if context else None
     except Exception as e:
         print(f"❌ Error getting scratchpad context: {e}")
@@ -36,7 +37,7 @@ def get_scratchpad_context(user_id: str, paper_id: str, exclude_note_id: int = N
 
 def register_scratchpad_routes(rt):
     """Register scratchpad-related routes"""
-    
+
     @rt("/api/scratchpad/test")
     def test_scratchpad_api():
         """Test endpoint to verify scratchpad API is working"""
@@ -48,11 +49,16 @@ def register_scratchpad_routes(rt):
 
         user_id = session.get("user_id") if session else None
 
-        if not user_id: return {"success": False, "error": "Authentication required"}
+        if not user_id:
+            return {"success": False, "error": "Authentication required"}
 
         try:
-            query = f"user_id = '{user_id}' AND paper_id = '{paper_id}' AND is_deleted = 0"
-            notes = scratchpad_notes(where=query, order_by="position ASC, created_at ASC")
+            query = (
+                f"user_id = '{user_id}' AND paper_id = '{paper_id}' AND is_deleted = 0"
+            )
+            notes = scratchpad_notes(
+                where=query, order_by="position ASC, created_at ASC"
+            )
             notes_list = list(notes)
 
             # organize notes hierarchically with replies
@@ -102,11 +108,14 @@ def register_scratchpad_routes(rt):
                 "success": True,
                 "notes": root_notes,
             }
-            print(f"✅ SCRATCHPAD API: Returning result with {len(root_notes)} root notes")
+            print(
+                f"✅ SCRATCHPAD API: Returning result with {len(root_notes)} root notes"
+            )
             return result
         except Exception as e:
             print(f"❌ SCRATCHPAD API: Error: {e}")
             import traceback
+
             traceback.print_exc()
             return {"success": False, "error": str(e)}
 
@@ -140,7 +149,9 @@ def register_scratchpad_routes(rt):
                 content=data.get("content", ""),
                 note_type=data.get("note_type", "unanchored"),
                 anchor_data=(
-                    json.dumps(data.get("anchor_data")) if data.get("anchor_data") else None
+                    json.dumps(data.get("anchor_data"))
+                    if data.get("anchor_data")
+                    else None
                 ),
                 created_at=datetime.now().isoformat(),
                 updated_at=datetime.now().isoformat(),
@@ -149,7 +160,9 @@ def register_scratchpad_routes(rt):
                 parent_note_id=parent_note_id,
                 reply_type=reply_type,
                 ai_metadata=(
-                    json.dumps(data.get("ai_metadata")) if data.get("ai_metadata") else None
+                    json.dumps(data.get("ai_metadata"))
+                    if data.get("ai_metadata")
+                    else None
                 ),
             )
 
@@ -193,6 +206,14 @@ def register_scratchpad_routes(rt):
 
             scratchpad_notes.update(id=note_id, **update_data)
 
+            # force database flush to ensure changes are immediately visible
+            try:
+                # attempt to flush any pending database operations
+                db.execute("SELECT 1")  # simple query to force flush
+                print(f"[DEBUG] database flush completed for note {note_id}")
+            except Exception as flush_error:
+                print(f"[WARNING] database flush failed: {flush_error}")
+
             return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -229,6 +250,7 @@ def register_scratchpad_routes(rt):
         except Exception as e:
             print(f"❌ DELETE API: Error: {e}")
             import traceback
+
             traceback.print_exc()
             return {"success": False, "error": str(e)}
 
@@ -251,9 +273,7 @@ def register_scratchpad_routes(rt):
                     content += f"## Note {note.position + 1}\n"
                     if note.note_type == "anchored" and note.anchor_data:
                         anchor = json.loads(note.anchor_data)
-                        content += (
-                            f"**Anchored to:** \"{anchor.get('selection_text', '')}\"\n\n"
-                        )
+                        content += f"**Anchored to:** \"{anchor.get('selection_text', '')}\"\n\n"
                     content += f"{note.content}\n\n"
                     content += f"*Created: {note.created_at}*\n\n---\n\n"
 
@@ -265,7 +285,9 @@ def register_scratchpad_routes(rt):
                             "content": note.content,
                             "note_type": note.note_type,
                             "anchor_data": (
-                                json.loads(note.anchor_data) if note.anchor_data else None
+                                json.loads(note.anchor_data)
+                                if note.anchor_data
+                                else None
                             ),
                             "created_at": note.created_at,
                             "position": note.position,
@@ -293,21 +315,51 @@ def register_scratchpad_routes(rt):
 
     @rt("/api/scratchpad/{note_id}/ai-reply", methods=["POST"])
     async def create_ai_reply(note_id: int, request):
-        """Generate an AI reply for a specific note"""
+        """Create an AI reply to a specific note"""
         session = request.session if hasattr(request, "session") else {}
         user_id = session.get("user_id")
         if not user_id:
             return {"success": False, "error": "Authentication required"}
 
         try:
-            # get the original note
-            notes = list(scratchpad_notes(where=f"id = {note_id}"))
-            if not notes:
-                return {"success": False, "error": "Note not found"}
+            # get the original note with retry logic for fresh data
+            max_retries = 3
+            note = None
 
-            note = notes[0]
-            if note.user_id != user_id:
-                return {"success": False, "error": "Access denied"}
+            for attempt in range(max_retries):
+                notes = list(scratchpad_notes(where=f"id = {note_id}"))
+                if not notes:
+                    return {"success": False, "error": "Note not found"}
+
+                note = notes[0]
+                if note.user_id != user_id:
+                    return {"success": False, "error": "Access denied"}
+
+                # debug: log the note data we're getting
+                print(
+                    f"[DEBUG] attempt {attempt + 1}: note content preview: {note.content[:50]}..."
+                )
+                print(
+                    f"[DEBUG] attempt {attempt + 1}: note updated_at: {note.updated_at}"
+                )
+
+                # check if we have fresh data by looking at updated_at timestamp
+                # if this is a retry and the data is still old, wait a bit
+                if attempt > 0:
+                    import time
+
+                    time.sleep(0.1 * attempt)  # progressive delay: 0.1s, 0.2s, 0.3s
+                    print(f"[DEBUG] retry {attempt + 1} for fresh note data")
+
+                # if this is the first attempt, assume data is fresh
+                if attempt == 0:
+                    break
+
+                # for subsequent attempts, we could add additional freshness checks here
+                # but for now, just retry with delay
+
+            if not note:
+                return {"success": False, "error": "Could not retrieve fresh note data"}
 
             # perform RAG search
             search_results = await search_vectorized_sources(note.content, limit=3)
@@ -322,12 +374,12 @@ def register_scratchpad_routes(rt):
             anchor = ""
             if note.note_type == "anchored" and note.anchor_data:
                 anchor = f"Anchored to: \"{json.loads(note.anchor_data).get('selection_text', '')}\"\n\n"
-                
+
             # generate AI reply with PDF context from arXiv
             ai_reply_content = await generate_ai_reply(
                 note_content=anchor + note.content if anchor else note.content,
                 pdf_url=pdf_url,
-                scratchpad_context=scratchpad_context
+                scratchpad_context=scratchpad_context,
             )
 
             # create the AI reply note

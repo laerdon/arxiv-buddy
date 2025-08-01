@@ -256,13 +256,26 @@ async def _fallback_keyword_search(query: str, limit: int) -> List[Dict[str, Any
 
 
 async def generate_ai_reply(
-    note_content: str, pdf_url: str = None, scratchpad_context: str = None
+    note_content: str,
+    pdf_url: str = None,
+    scratchpad_context: str = None,
+    use_tools: bool = True,
 ) -> str:
-    """Generate AI reply based on note content and PDF context"""
+    """
+    Generate AI reply using Claude with optional tool calling capabilities.
+
+    Args:
+        note_content: The user's note content
+        pdf_url: Optional PDF URL for context
+        scratchpad_context: Other notes on the paper
+        use_tools: Whether to enable tool calling (default: True)
+    """
     if not claude_client:
         return "ai reply functionality requires anthropic api key"
 
     try:
+        from services.tool_service import get_available_tools, execute_tool
+
         # Build message content with text and optional PDF
         content_list = []
 
@@ -284,21 +297,98 @@ async def generate_ai_reply(
 
 "{note_content}"
 
-Provide a helpful response that is thoughtful but concise. Only reference other notes if they directly relate to the current note. Aim for around 50 words."""
+You have access to a vectorized knowledge base of research papers and sources. Use the search_knowledge_base tool when the user's note would benefit from additional context, references, or specific information.
+
+Provide a helpful, thoughtful response that is concise but informative. If you use the knowledge base, integrate the findings naturally into your response."""
 
         content_list.append({"type": "text", "text": prompt})
 
-        # NOTE: This is a log
+        # Log the text passed to Claude
         print(f"[INFO] text passed to claude: {prompt}")
 
-        # Add PDF if available
-
+        # Prepare Claude message with tool support
         message = claude_msg("user", content_list)
+
+        # Get available tools if tool calling is enabled
+        tools = get_available_tools() if use_tools else None
+
+        if tools:
+            print(f"[INFO] claude has access to {len(tools)} tools")
+
+        # Make initial Claude request
         response = claude_client.messages.create(
-            model="claude-3-5-sonnet-20241022", max_tokens=350, messages=[message]
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=500,
+            messages=[message],
+            tools=tools if tools else None,
         )
 
-        return response.content[0].text.strip()
+        # Handle tool use if Claude requests it
+        if response.content and any(
+            block.type == "tool_use" for block in response.content
+        ):
+            print("[INFO] claude is using tools...")
+
+            # Execute tools and collect results
+            tool_results = []
+            messages = [message]  # Start with original message
+
+            # Add Claude's response (which contains tool use)
+            messages.append({"role": "assistant", "content": response.content})
+
+            # Execute each tool request
+            for block in response.content:
+                if block.type == "tool_use":
+                    tool_name = block.name
+                    tool_input = block.input
+                    tool_use_id = block.id
+
+                    print(f"[INFO] executing tool: {tool_name}")
+
+                    # Execute the tool
+                    tool_result = await execute_tool(tool_name, tool_input)
+
+                    # Add tool result to messages
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": str(tool_result.get("result", tool_result)),
+                        }
+                    )
+
+            # Add tool results to conversation
+            if tool_results:
+                messages.append({"role": "user", "content": tool_results})
+
+                # Get Claude's final response with tool results
+                final_response = claude_client.messages.create(
+                    model="claude-3-5-sonnet-20241022",
+                    max_tokens=500,
+                    messages=messages,
+                    tools=tools,
+                )
+
+                # Extract final text response
+                final_text = ""
+                for block in final_response.content:
+                    if block.type == "text":
+                        final_text += block.text
+
+                return (
+                    final_text.strip()
+                    if final_text
+                    else "Could not generate response with tool results"
+                )
+
+        # Handle regular response (no tools used)
+        response_text = ""
+        for block in response.content:
+            if block.type == "text":
+                response_text += block.text
+
+        return response_text.strip() if response_text else "Could not generate response"
+
     except Exception as e:
         print(f"[ERROR] ai reply generation error: {e}")
         return f"ai reply generation failed: {str(e)}"
